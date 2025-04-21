@@ -1,0 +1,9 @@
+streamlit
+numpy
+pandas
+librosa
+matplotlib
+pydub
+soundfile
+boto3
+faster-whisper

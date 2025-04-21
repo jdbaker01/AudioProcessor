@@ -1,0 +1,631 @@
+import streamlit as st
+import os
+import librosa
+import librosa.display
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from io import BytesIO
+import boto3
+import json
+import soundfile as sf
+import tempfile
+from faster_whisper import WhisperModel
+from pydub import AudioSegment
+
+# Set page configuration
+st.set_page_config(
+    page_title="Audio Processor",
+    page_icon="🎵",
+    layout="wide"
+)
+
+# Initialize session state for persistent settings
+if 'selected_file' not in st.session_state:
+    st.session_state.selected_file = None
+
+# Initialize AI configuration in session state
+if 'whisper_model' not in st.session_state:
+    st.session_state.whisper_model = "base"
+    
+if 'claude_model' not in st.session_state:
+    st.session_state.claude_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+    
+if 'summary_prompt' not in st.session_state:
+    st.session_state.summary_prompt = "Please provide a concise summary of the following transcript:\n\n{text}\n\nSummary:"
+    
+if 'action_items_prompt' not in st.session_state:
+    st.session_state.action_items_prompt = "Please extract a list of action items from the following transcript. Format them as a bulleted list:\n\n{text}\n\nAction Items:"
+
+# Create directories if they don't exist
+os.makedirs("audio_files", exist_ok=True)
+os.makedirs("processed_files", exist_ok=True)
+
+def save_uploaded_file(uploaded_file):
+    """Save the uploaded audio file to the audio_files directory"""
+    file_path = os.path.join("audio_files", uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return file_path
+
+def transcribe_audio(file_path):
+    """Transcribe audio using faster-whisper model"""
+    try:
+        # Get the filename without extension
+        filename = os.path.basename(file_path)
+        name, ext = os.path.splitext(filename)
+        
+        # Get the model name from session state
+        model_name = st.session_state.whisper_model
+        
+        # Load the Whisper model
+        with st.spinner(f"Loading Whisper {model_name} model..."):
+            # Use CPU or CUDA if available
+            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        
+        # Transcribe the audio
+        with st.spinner("Transcribing audio..."):
+            segments, info = model.transcribe(file_path, beam_size=5)
+            
+            # Collect all segments
+            transcription_parts = []
+            detailed_transcription = []
+            
+            for segment in segments:
+                transcription_parts.append(segment.text)
+                start_time = format_timestamp(segment.start)
+                end_time = format_timestamp(segment.end)
+                detailed_transcription.append(f"[{start_time} --> {end_time}] {segment.text}")
+            
+            transcription = " ".join(transcription_parts)
+        
+        # Save the transcription to a text file
+        transcription_path = os.path.join("processed_files", f"{name}_transcription.txt")
+        with open(transcription_path, "w") as f:
+            f.write(transcription)
+        
+        # Save detailed transcription with timestamps
+        detailed_path = os.path.join("processed_files", f"{name}_detailed_transcription.txt")
+        with open(detailed_path, "w") as f:
+            f.write("\n".join(detailed_transcription))
+        
+        return transcription_path, transcription
+    
+    except Exception as e:
+        st.error(f"Error transcribing audio: {e}")
+        return None, str(e)
+
+def process_with_bedrock(text, task, model_id):
+    """Process text with Amazon Bedrock Claude model"""
+    try:
+        # Create a Bedrock client
+        bedrock_runtime = boto3.client(
+            service_name='bedrock-runtime',
+            region_name='us-east-1'  # Change to your preferred region
+        )
+        
+        # Prepare the prompt based on the task
+        if task == "summarize":
+            prompt = st.session_state.summary_prompt.format(text=text)
+        elif task == "action_items":
+            prompt = st.session_state.action_items_prompt.format(text=text)
+        else:
+            return "Invalid task specified"
+        
+        # Prepare the request for Claude
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        }
+        
+        # Invoke the model
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps(request_body)
+        )
+        
+        # Parse the response
+        response_body = json.loads(response['body'].read().decode('utf-8'))
+        result = response_body['content'][0]['text']
+        
+        return result
+    
+    except Exception as e:
+        st.error(f"Error processing with Bedrock: {e}")
+        return str(e)
+
+def format_timestamp(seconds):
+    """Format seconds into HH:MM:SS.mmm format"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+def display_audio_waveform(file_path):
+    """Display the waveform of an audio file"""
+    y, sr = librosa.load(file_path)
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    librosa.display.waveshow(y, sr=sr, ax=ax)
+    ax.set_title('Waveform')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Amplitude')
+    
+    return fig
+
+def display_spectrogram(file_path):
+    """Display the spectrogram of an audio file"""
+    y, sr = librosa.load(file_path)
+    
+    # Compute spectrogram
+    D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    img = librosa.display.specshow(D, x_axis='time', y_axis='log', ax=ax)
+    ax.set_title('Spectrogram')
+    fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    
+    return fig
+
+def main():
+    st.title("Audio Processor")
+    
+    # Create tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["Upload Audio", "Process Audio", "View Processed Audio", "AI Configuration"])
+    
+    # Tab 1: Upload Audio
+    with tab1:
+        st.header("Upload Audio Files")
+        
+        uploaded_file = st.file_uploader("Choose an audio file", type=["wav", "mp3", "ogg"])
+        
+        if uploaded_file is not None:
+            st.success(f"File {uploaded_file.name} uploaded successfully!")
+            
+            # Save the uploaded file
+            file_path = save_uploaded_file(uploaded_file)
+            
+            # Display audio player
+            st.audio(uploaded_file)
+    
+    # Tab 2: Process Audio
+    with tab2:
+        st.header("Process Audio Files")
+        
+        # Get list of uploaded audio files
+        audio_files = [f for f in os.listdir("audio_files") if f.endswith((".wav", ".mp3", ".ogg"))]
+        
+        if not audio_files:
+            st.info("No audio files uploaded yet. Please upload files in the 'Upload Audio' tab.")
+        else:
+            # Select file to process
+            selected_file = st.selectbox("Select audio file to process", audio_files)
+            file_path = os.path.join("audio_files", selected_file)
+            
+            # Display audio player for selected file
+            st.audio(file_path)
+            
+            # Post-processing options
+            st.markdown("### Post-processing Options")
+            
+            # Create a styled container for the checkboxes
+            with st.container():
+                # Apply custom CSS
+                st.markdown("""
+                <style>
+                .stCheckbox {
+                    margin-bottom: 10px;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # Create a box around the checkboxes
+                with st.expander("AI Analysis Options", expanded=True):
+                    summarize = st.checkbox("Summarize Audio")
+                    action_items = st.checkbox("List Action Items")
+            
+            # Transcribe button
+            if st.button("Transcribe Audio"):
+                transcription_path, transcription = transcribe_audio(file_path)
+                
+                if transcription_path:
+                    st.success(f"Audio transcribed successfully! Saved as {os.path.basename(transcription_path)}")
+                    
+                    # Display transcription
+                    st.subheader("Transcription Result")
+                    st.text_area("Transcription", transcription, height=200)
+                    
+                    # Option to download transcription
+                    with open(transcription_path, "r") as file:
+                        st.download_button(
+                            label="Download transcription",
+                            data=file,
+                            file_name=os.path.basename(transcription_path),
+                            mime="text/plain"
+                        )
+                    
+                    # Check if detailed transcription exists
+                    detailed_path = os.path.join("processed_files", f"{os.path.splitext(os.path.basename(file_path))[0]}_detailed_transcription.txt")
+                    if os.path.exists(detailed_path):
+                        with open(detailed_path, "r") as file:
+                            st.download_button(
+                                label="Download detailed transcription with timestamps",
+                                data=file,
+                                file_name=os.path.basename(detailed_path),
+                                mime="text/plain"
+                            )
+                    
+                    # Process with Bedrock if requested
+                    if summarize:
+                        with st.spinner("Generating summary with Claude..."):
+                            summary = process_with_bedrock(transcription, "summarize", st.session_state.claude_model)
+                            
+                            # Save summary
+                            summary_path = os.path.join("processed_files", f"{os.path.splitext(os.path.basename(file_path))[0]}_summary.txt")
+                            with open(summary_path, "w") as f:
+                                f.write(summary)
+                            
+                            # Display summary
+                            st.subheader("Summary")
+                            st.text_area("Summary of Audio", summary, height=200)
+                            
+                            # Option to download summary
+                            with open(summary_path, "r") as file:
+                                st.download_button(
+                                    label="Download summary",
+                                    data=file,
+                                    file_name=os.path.basename(summary_path),
+                                    mime="text/plain"
+                                )
+                    
+                    if action_items:
+                        with st.spinner("Extracting action items with Claude..."):
+                            actions = process_with_bedrock(transcription, "action_items", st.session_state.claude_model)
+                            
+                            # Save action items
+                            actions_path = os.path.join("processed_files", f"{os.path.splitext(os.path.basename(file_path))[0]}_action_items.txt")
+                            with open(actions_path, "w") as f:
+                                f.write(actions)
+                            
+                            # Display action items
+                            st.subheader("Action Items")
+                            st.text_area("Action Items from Audio", actions, height=200)
+                            
+                            # Option to download action items
+                            with open(actions_path, "r") as file:
+                                st.download_button(
+                                    label="Download action items",
+                                    data=file,
+                                    file_name=os.path.basename(actions_path),
+                                    mime="text/plain"
+                                )
+    
+    # Tab 3: View Processed Audio
+    with tab3:
+        st.header("View Processed Audio Files")
+        
+        # Get list of all audio files (both original and processed)
+        all_audio_files = []
+        
+        # Add files from audio_files directory
+        for f in os.listdir("audio_files"):
+            if f.endswith((".wav", ".mp3", ".ogg", ".m4a")):
+                all_audio_files.append(("audio_files", f))
+        
+        # Add files from processed_files directory
+        for f in os.listdir("processed_files"):
+            if f.endswith((".wav", ".mp3", ".ogg")):
+                all_audio_files.append(("processed_files", f))
+        
+        if not all_audio_files:
+            st.info("No audio files found. Please upload files in the 'Upload Audio' tab.")
+        else:
+            # Create two columns layout
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.subheader("Audio Files")
+                
+                # Add some CSS to make the file list more modern
+                st.markdown("""
+                <style>
+                div.stButton > button {
+                    width: 100%;
+                    text-align: left;
+                    padding: 10px 15px;
+                    margin: 5px 0;
+                    border-radius: 5px;
+                    border: 1px solid #e0e0e0;
+                    background-color: white;
+                    transition: all 0.3s;
+                }
+                div.stButton > button:hover {
+                    background-color: #f0f2f6;
+                    border-color: #aaa;
+                }
+                div.stButton > button.selected {
+                    background-color: #e6f0ff;
+                    border-color: #4c8bf5;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # Store the selected file in session state if it doesn't exist
+                if 'selected_file' not in st.session_state:
+                    st.session_state.selected_file = all_audio_files[0][1]
+                
+                # Create a function to update the selected file
+                def select_file(file):
+                    st.session_state.selected_file = file
+                
+                # Create a modern list of files using buttons
+                for dir_name, file_name in all_audio_files:
+                    # Determine if this file is selected
+                    is_selected = st.session_state.selected_file == file_name
+                    
+                    # Create a button for each file
+                    if st.button(
+                        f"🔊 {file_name}", 
+                        key=f"btn_{file_name}",
+                        help=f"Click to view details for {file_name}",
+                        on_click=select_file,
+                        args=(file_name,)
+                    ):
+                        pass
+                
+                # Initialize selected file if it's None
+                if st.session_state.selected_file is None and all_audio_files:
+                    st.session_state.selected_file = all_audio_files[0][1]
+                
+                # Get the directory for the selected file
+                if st.session_state.selected_file:
+                    selected_dir = next((dir for dir, file in all_audio_files if file == st.session_state.selected_file), None)
+                    if selected_dir:
+                        file_path = os.path.join(selected_dir, st.session_state.selected_file)
+                        
+                        # Display audio player for selected file
+                        st.audio(file_path)
+            
+            with col2:
+                # Only show analysis if a file is selected
+                if st.session_state.selected_file:
+                    st.subheader(f"Analysis: {st.session_state.selected_file}")
+                    
+                    # Get the base name without extension
+                    base_name = os.path.splitext(st.session_state.selected_file)[0]
+                    
+                    # Check if this file has been processed (has a transcription)
+                    transcription_file = f"{base_name}_transcription.txt"
+                    transcription_path = os.path.join("processed_files", transcription_file)
+                    
+                    if not os.path.exists(transcription_path):
+                        st.warning("Audio has not been processed.")
+                        st.markdown("""
+                        <div style="padding: 20px; background-color: #f8f9fa; border-radius: 10px; text-align: center;">
+                            <h3 style="color: #6c757d;">No Analysis Available</h3>
+                            <p>This audio file hasn't been processed yet. Go to the Process Audio tab to transcribe and analyze this file.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # Display transcription
+                        with st.expander("Transcription", expanded=False):
+                            with open(transcription_path, "r") as f:
+                                transcription = f.read()
+                            st.text_area("", transcription, height=150)
+                            
+                            # Option to download transcription
+                            st.download_button(
+                                label="Download transcription",
+                                data=transcription,
+                                file_name=transcription_file,
+                                mime="text/plain"
+                            )
+                        
+                        # Check for and display summary
+                        summary_file = f"{base_name}_summary.txt"
+                        summary_path = os.path.join("processed_files", summary_file)
+                        
+                        st.markdown("""
+                        <h3 style="color: #333; border-bottom: 1px solid #ddd; padding-bottom: 8px;">Summary</h3>
+                        """, unsafe_allow_html=True)
+                        
+                        if os.path.exists(summary_path):
+                            with open(summary_path, "r") as f:
+                                summary = f.read()
+                            
+                            st.markdown(f"""
+                            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #4c8bf5;">
+                                {summary.replace('\n', '<br>')}
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Option to download summary
+                            st.download_button(
+                                label="Download summary",
+                                data=summary,
+                                file_name=summary_file,
+                                mime="text/plain"
+                            )
+                        else:
+                            st.markdown("""
+                            <div style="padding: 15px; background-color: #f8f9fa; border-radius: 5px; text-align: center; color: #6c757d;">
+                                No summary available
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Check for and display action items
+                        actions_file = f"{base_name}_action_items.txt"
+                        actions_path = os.path.join("processed_files", actions_file)
+                        
+                        st.markdown("""
+                        <h3 style="color: #333; border-bottom: 1px solid #ddd; padding-bottom: 8px; margin-top: 20px;">Action Items</h3>
+                        """, unsafe_allow_html=True)
+                        
+                        if os.path.exists(actions_path):
+                            with open(actions_path, "r") as f:
+                                actions = f.read()
+                            
+                            st.markdown(f"""
+                            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745;">
+                                {actions.replace('\n', '<br>')}
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Option to download action items
+                            st.download_button(
+                                label="Download action items",
+                                data=actions,
+                                file_name=actions_file,
+                                mime="text/plain"
+                            )
+                        else:
+                            st.markdown("""
+                            <div style="padding: 15px; background-color: #f8f9fa; border-radius: 5px; text-align: center; color: #6c757d;">
+                                No action items available
+                            </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.info("Select an audio file from the list on the left to view its analysis.")
+    
+    # Tab 4: AI Configuration
+    with tab4:
+        st.header("AI Configuration")
+        
+        # Create two columns for the configuration
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Whisper Configuration")
+            
+            # Whisper model selection
+            st.session_state.whisper_model = st.selectbox(
+                "Select Whisper model",
+                ["tiny", "base", "small", "medium", "large-v3"],
+                index=["tiny", "base", "small", "medium", "large-v3"].index(st.session_state.whisper_model),
+                key="whisper_model_select"
+            )
+            
+            st.markdown("""
+            <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                <p><strong>Model Size Guide:</strong></p>
+                <ul>
+                    <li><strong>tiny</strong>: Fastest, lowest accuracy</li>
+                    <li><strong>base</strong>: Good balance for most use cases</li>
+                    <li><strong>small</strong>: Better accuracy, slower than base</li>
+                    <li><strong>medium</strong>: High accuracy, slower processing</li>
+                    <li><strong>large-v3</strong>: Highest accuracy, slowest processing</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.subheader("Claude Configuration")
+            
+            # Claude model selection
+            st.session_state.claude_model = st.selectbox(
+                "Select Claude model",
+                [
+                    "anthropic.claude-3-sonnet-20240229-v1:0",
+                    "anthropic.claude-3-haiku-20240307-v1:0",
+                    "anthropic.claude-3-opus-20240229-v1:0"
+                ],
+                index=["anthropic.claude-3-sonnet-20240229-v1:0", "anthropic.claude-3-haiku-20240307-v1:0", "anthropic.claude-3-opus-20240229-v1:0"].index(st.session_state.claude_model)
+            )
+            
+            st.markdown("""
+            <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                <p><strong>Model Guide:</strong></p>
+                <ul>
+                    <li><strong>Claude 3 Haiku</strong>: Fastest, good for simple tasks</li>
+                    <li><strong>Claude 3 Sonnet</strong>: Balanced performance and quality</li>
+                    <li><strong>Claude 3 Opus</strong>: Highest quality, most capable, slowest</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Prompt configuration
+        st.subheader("Prompt Templates")
+        
+        # Summary prompt
+        st.markdown("#### Summary Prompt")
+        st.session_state.summary_prompt = st.text_area(
+            "Template for generating summaries",
+            value=st.session_state.summary_prompt,
+            height=150,
+            help="Use {text} as a placeholder for the transcript"
+        )
+        
+        # Action items prompt
+        st.markdown("#### Action Items Prompt")
+        st.session_state.action_items_prompt = st.text_area(
+            "Template for extracting action items",
+            value=st.session_state.action_items_prompt,
+            height=150,
+            help="Use {text} as a placeholder for the transcript"
+        )
+        
+        # Save configuration button
+        if st.button("Save Configuration"):
+            st.success("AI configuration saved successfully!")
+            st.balloons()
+
+        with col2:
+            st.subheader("Claude Configuration")
+            
+            # Claude model selection
+            st.session_state.claude_model = st.selectbox(
+                "Select Claude model",
+                [
+                    "anthropic.claude-3-sonnet-20240229-v1:0",
+                    "anthropic.claude-3-haiku-20240307-v1:0",
+                    "anthropic.claude-3-opus-20240229-v1:0"
+                ],
+                index=["anthropic.claude-3-sonnet-20240229-v1:0", "anthropic.claude-3-haiku-20240307-v1:0", "anthropic.claude-3-opus-20240229-v1:0"].index(st.session_state.claude_model)
+            )
+            
+            st.markdown("""
+            <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                <p><strong>Model Guide:</strong></p>
+                <ul>
+                    <li><strong>Claude 3 Haiku</strong>: Fastest, good for simple tasks</li>
+                    <li><strong>Claude 3 Sonnet</strong>: Balanced performance and quality</li>
+                    <li><strong>Claude 3 Opus</strong>: Highest quality, most capable, slowest</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Prompt configuration
+        st.subheader("Prompt Templates")
+        
+        # Summary prompt
+        st.markdown("#### Summary Prompt")
+        st.session_state.summary_prompt = st.text_area(
+            "Template for generating summaries",
+            value=st.session_state.summary_prompt,
+            height=150,
+            help="Use {text} as a placeholder for the transcript"
+        )
+        
+        # Action items prompt
+        st.markdown("#### Action Items Prompt")
+        st.session_state.action_items_prompt = st.text_area(
+            "Template for extracting action items",
+            value=st.session_state.action_items_prompt,
+            height=150,
+            help="Use {text} as a placeholder for the transcript"
+        )
+        
+        # Save configuration button
+        if st.button("Save Configuration"):
+            st.success("AI configuration saved successfully!")
+            st.balloons()
+
+
+if __name__ == "__main__":
+    main()
