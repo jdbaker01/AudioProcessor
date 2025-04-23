@@ -7,3 +7,5 @@ pydub
 soundfile
 boto3
 faster-whisper
+streamlit-authenticator
+
